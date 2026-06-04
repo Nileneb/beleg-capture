@@ -1,21 +1,19 @@
-"""Sachkonto-Vorschlag aus dem prefilter-Präzedenz-Index.
+"""Sachkonto-Vorschlag über den prefilter-api-Endpoint POST /api/suggest.
 
-Der Index wird von prefilter-api aus den Altdaten gebaut:
-    python -m src.kontierung build <alt-export.csv> --out data/konto_index
+beleg bleibt schlank: kein Embedding-Modell, kein Index-Lesen — nur ein
+HTTP-Call. prefilter hält den Präzedenz-Index (Kreditor-Häufigkeit + optional
+Buchungstext-Embedding-kNN) und das Modell an einer Stelle.
 
-Hier wird nur das portable Artefakt (`index.json`) gelesen — keine prefilter-
-Abhängigkeit, kein Embedding, nur stdlib. Primärsignal: Kreditor→Konto-
-Häufigkeit aus den Altdaten (gleicher Lieferant → meist gleiches Konto).
-
-Fail-soft-LAUT: fehlt der Index oder der Kreditor, liefert `suggest_konto`
-eine leere Liste UND einen Grund-String für die UI — kein stummes Schlucken.
+Fail-soft-LAUT: ist der Endpoint nicht erreichbar oder der Index nicht gebaut,
+liefert `suggest_konto` eine leere Liste UND einen Grund-String für die UI —
+kein stummes Schlucken.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
+
+import requests
 
 import config
 
@@ -28,57 +26,38 @@ class KontoSuggestion:
     reason: str
 
 
-_INDEX: dict | None = None
-_LOAD_ERROR: str | None = None
-
-
-def _norm_kreditor(name: object) -> str:
-    return " ".join(str(name).strip().lower().split())
-
-
-def _load() -> None:
-    global _INDEX, _LOAD_ERROR
-    if _INDEX is not None or _LOAD_ERROR is not None:
-        return
-    p = Path(config.KONTO_INDEX_PATH) / "index.json"
-    if not p.exists():
-        _LOAD_ERROR = (
-            f"Kein Kontierungs-Index unter {p}. In prefilter-api bauen:\n"
-            f"  python -m src.kontierung build <alt-export.csv> --out data/konto_index"
+def suggest_konto(
+    kreditor: str = "", buchungstext: str = "", top_k: int = 3
+) -> tuple[list[KontoSuggestion], str | None]:
+    """Fragt prefilter /api/suggest. Returns (suggestions, error|None)."""
+    url = f"{config.PREFILTER_API_URL}/api/suggest"
+    try:
+        resp = requests.post(
+            url,
+            json={"kreditor": kreditor, "buchungstext": buchungstext, "top_k": top_k},
+            timeout=config.SUGGEST_TIMEOUT,
         )
-        return
-    _INDEX = json.loads(p.read_text(encoding="utf-8"))
+    except requests.RequestException as exc:
+        return [], f"Vorschlags-API nicht erreichbar ({url}): {exc}"
 
+    if resp.status_code == 503:
+        return [], resp.json().get("warning", "Kontierungs-Index nicht verfügbar.")
+    if resp.status_code != 200:
+        return [], f"Vorschlags-API antwortete {resp.status_code}: {resp.text[:200]}"
 
-def suggest_konto(kreditor: str = "", top_k: int = 3) -> tuple[list[KontoSuggestion], str | None]:
-    """Schlägt Sachkonten zu einem Kreditor vor.
-
-    Returns (suggestions, error): error ist None bei Erfolg, sonst ein für die
-    UI gedachter Grund (Index fehlt / Kreditor unbekannt).
-    """
-    _load()
-    if _LOAD_ERROR:
-        return [], _LOAD_ERROR
-
-    assert _INDEX is not None
-    kc = _INDEX.get("kreditor_konto", {}).get(_norm_kreditor(kreditor))
-    if not kc:
-        n_known = len(_INDEX.get("kreditor_konto", {}))
-        return [], (
-            f"Kein Präzedenzfall für Kreditor „{kreditor.strip()}“ "
-            f"({n_known} bekannte Kreditoren im Index)."
-        )
-
-    gt = _INDEX.get("gt", {})
-    dia = _INDEX.get("diamant_bezeichnung", {})
-    total = sum(kc.values())
-    out = [
+    data = resp.json()
+    sugs = [
         KontoSuggestion(
-            konto=ko,
-            bezeichnung=gt.get(ko) or dia.get(ko, ""),
-            score=round(c / total, 3),
-            reason=f"{c}× bei „{kreditor.strip()}“ ({c / total:.0%})",
+            konto=s["konto"],
+            bezeichnung=s.get("bezeichnung", ""),
+            score=s.get("score", 0.0),
+            reason=s.get("reason", ""),
         )
-        for ko, c in sorted(kc.items(), key=lambda kv: -kv[1])[:top_k]
+        for s in data.get("suggestions", [])
     ]
-    return out, None
+    if not sugs:
+        return [], (
+            f"Kein Präzedenzfall für Kreditor „{kreditor.strip()}“ / „{buchungstext.strip()[:40]}“."
+        )
+    # warning (z.B. Text-kNN-Degradation) als Grund mitgeben, aber Treffer behalten
+    return sugs, data.get("warning")
