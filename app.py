@@ -29,16 +29,21 @@ def on_extract(image, mandant):
     except ExtractionError as exc:
         return empties + [dd_empty, None, f"❌ {exc}"]
 
-    # Sachkonto kennt das VLM nicht — aus dem Präzedenz-Index der Altdaten ziehen.
-    suggestions, sug_err = suggest_konto(proposal.get("kreditor", ""))
+    # Sachkonto kennt das VLM nicht — aus dem Präzedenz-Index (prefilter /api/suggest)
+    # ziehen: Kreditor-Häufigkeit + Buchungstext-kNN.
+    suggestions, sug_note_raw = suggest_konto(
+        proposal.get("kreditor", ""), proposal.get("buchungstext", "")
+    )
     if suggestions:
         proposal["sachkonto"] = suggestions[0].konto
         choices = [f"{s.konto} — {s.bezeichnung} ({s.reason})" for s in suggestions]
         dd_update = gr.update(choices=choices, value=choices[0])
         sug_note = f" · 🧭 Sachkonto-Vorschlag **{suggestions[0].konto}** ({len(suggestions)} Kandidaten)"
+        if sug_note_raw:  # Degradations-Hinweis (z.B. Text-kNN aus)
+            sug_note += f" ⚠️ {sug_note_raw}"
     else:
         dd_update = gr.update(choices=[], value=None)
-        sug_note = f" · 🧭 kein Sachkonto-Vorschlag: {sug_err}"
+        sug_note = f" · 🧭 kein Sachkonto-Vorschlag: {sug_note_raw}"
 
     field_updates = [proposal[f] for f in config.FIELDS]
     return field_updates + [
